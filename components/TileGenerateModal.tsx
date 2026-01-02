@@ -4,7 +4,8 @@ import React, { useState, useEffect } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import * as Tabs from "@radix-ui/react-tabs";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
-import { Check, Play, Settings } from "lucide-react";
+import * as Tooltip from "@radix-ui/react-tooltip";
+import { Check, Play, Settings, X as Close, RotateCcw, Wand2 } from "lucide-react";
 import { z } from "zod";
 
 interface TileGenerateModalProps {
@@ -26,12 +27,19 @@ export function TileGenerateModal({ open, onClose, x, y, z, onUpdate }: TileGene
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [previewId, setPreviewId] = useState<string | null>(null);
   const [blendPreview, setBlendPreview] = useState<boolean>(true);
+  const [offsetX, setOffsetX] = useState<number>(0);
+  const [offsetY, setOffsetY] = useState<number>(0);
+  const [driftPeak, setDriftPeak] = useState<number | null>(null);
+  const [driftLoading, setDriftLoading] = useState<boolean>(false);
   const [previewTiles, setPreviewTiles] = useState<string[][] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loadingTiles, setLoadingTiles] = useState(true);
   const [newTilePositions, setNewTilePositions] = useState<Set<string>>(new Set());
   const [selectedPositions, setSelectedPositions] = useState<Set<string>>(new Set());
   const [activeTab, setActiveTab] = useState<string>("preview");
+  // Nudge (drift correction) controls are optional and off by default
+  const [nudgeOpen, setNudgeOpen] = useState<boolean>(false);
+  const [nudgeApplied, setNudgeApplied] = useState<boolean>(false);
 
   // Load the 3x3 grid of tiles with selective cache busting
   useEffect(() => {
@@ -139,8 +147,11 @@ export function TileGenerateModal({ open, onClose, x, y, z, onUpdate }: TileGene
     });
   };
 
-  const loadPreviewTiles = async (id: string, blended: boolean) => {
-    const url = `/api/preview/${id}${blended ? '?mode=blended' : ''}`;
+  const loadPreviewTiles = async (id: string, blended: boolean, txOverride?: number, tyOverride?: number) => {
+    const tx = (txOverride != null ? Math.round(txOverride) : Math.round(offsetX)) || 0;
+    const ty = (tyOverride != null ? Math.round(tyOverride) : Math.round(offsetY)) || 0;
+    const qp = blended ? `?mode=blended&tx=${tx}&ty=${ty}` : '';
+    const url = `/api/preview/${id}${qp}`;
     setPreviewUrl(url);
     const extractedTiles = await extractTilesFromComposite(url);
     setPreviewTiles(extractedTiles);
@@ -158,6 +169,79 @@ export function TileGenerateModal({ open, onClose, x, y, z, onUpdate }: TileGene
       }
       return sel;
     });
+  };
+
+  // Utility: turn a data URL into a Blob
+  const dataUrlToBlob = async (dataUrl: string): Promise<Blob> => {
+    const res = await fetch(dataUrl);
+    return await res.blob();
+  };
+
+  // Compute drift between existing center and raw generated center; set offsets
+  const computeDrift = async (id: string) => {
+    try {
+      setDriftLoading(true);
+      // Ensure we have raw generated tiles
+      const rawUrl = `/api/preview/${id}`; // raw mode
+      const rawTiles = await extractTilesFromComposite(rawUrl);
+      if (!tiles || !rawTiles) return;
+
+      // Choose only selected positions that already exist
+      const pairs: { ex: string; gen: string }[] = [];
+      const positionsUsed: string[] = [];
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const tileX = x + dx;
+          const tileY = y + dy;
+          const key = `${tileX},${tileY}`;
+          const selected = selectedPositions.size > 0 ? selectedPositions.has(key) : true; // default to all existing
+          const exists = !newTilePositions.has(key);
+          if (!selected || !exists) continue;
+          const ex = tiles[dy + 1]?.[dx + 1];
+          const gen = rawTiles[dy + 1]?.[dx + 1];
+          if (ex && gen) {
+            pairs.push({ ex, gen });
+            positionsUsed.push(key);
+          }
+        }
+      }
+
+      if (pairs.length === 0) {
+        // No existing tiles in selection -> zero drift
+        setOffsetX(0); setOffsetY(0); setDriftPeak(null);
+        return { tx: 0, ty: 0 };
+      }
+
+      // Compute drift per pair and average
+      const dxs: number[] = [], dys: number[] = [], peaks: number[] = [];
+      for (const p of pairs) {
+        const form = new FormData();
+        form.append('a', await dataUrlToBlob(p.ex), 'a.png');
+        form.append('b', await dataUrlToBlob(p.gen), 'b.png');
+        const resp = await fetch('/api/drift', { method: 'POST', body: form });
+        if (!resp.ok) continue;
+        const json = await resp.json();
+        dxs.push(json.dx || 0);
+        dys.push(json.dy || 0);
+        if (typeof json.peakValue === 'number') peaks.push(json.peakValue);
+      }
+
+      if (dxs.length === 0) { setOffsetX(0); setOffsetY(0); setDriftPeak(null); return; }
+
+      const avg = (arr: number[]) => arr.reduce((a,b)=>a+b,0) / arr.length;
+      // Use measured drift directly as the adjustment so UI displays
+      // values in the same direction the overlay will move.
+      const tx = Math.round(avg(dxs));
+      const ty = Math.round(avg(dys));
+      setOffsetX(tx);
+      setOffsetY(ty);
+      setDriftPeak(peaks.length ? avg(peaks) : null);
+      return { tx, ty };
+    } catch (e) {
+      // ignore failures silently in UI
+    } finally {
+      setDriftLoading(false);
+    }
   };
 
   const handleEdit = async () => {
@@ -178,6 +262,7 @@ export function TileGenerateModal({ open, onClose, x, y, z, onUpdate }: TileGene
       }
       const data = await response.json();
       setPreviewId(data.previewId);
+      // Default to no drift correction until user opts-in
       await loadPreviewTiles(data.previewId, blendPreview);
     } catch (err) {
       setError(err instanceof Error ? err.message : "An error occurred");
@@ -198,6 +283,8 @@ export function TileGenerateModal({ open, onClose, x, y, z, onUpdate }: TileGene
         body: JSON.stringify({ 
           previewUrl: `/api/preview/${previewId}`,
           selectedPositions: Array.from(selectedPositions).map(s => { const [sx,sy] = s.split(',').map(Number); return { x: sx, y: sy }; }),
+          offsetX: blendPreview && nudgeApplied ? Math.round(offsetX) : undefined,
+          offsetY: blendPreview && nudgeApplied ? Math.round(offsetY) : undefined,
         }),
       });
       if (!response.ok) throw new Error("Failed to confirm edits");
@@ -228,6 +315,7 @@ export function TileGenerateModal({ open, onClose, x, y, z, onUpdate }: TileGene
       }
       const data = await response.json();
       setPreviewId(data.previewId);
+      // Default to no drift correction until user opts-in
       await loadPreviewTiles(data.previewId, blendPreview);
     } catch (err) {
       setError(err instanceof Error ? err.message : "An error occurred");
@@ -242,6 +330,11 @@ export function TileGenerateModal({ open, onClose, x, y, z, onUpdate }: TileGene
     setPreviewId(null);
     setPreviewTiles(null);
     setError(null);
+    setOffsetX(0);
+    setOffsetY(0);
+    setDriftPeak(null);
+    setNudgeOpen(false);
+    setNudgeApplied(false);
   };
 
   const handleClose = () => {
@@ -432,41 +525,176 @@ export function TileGenerateModal({ open, onClose, x, y, z, onUpdate }: TileGene
                         </div>
                       </div>
                     </div>
-                    {previewTiles && (
-                      <div className="text-xs text-gray-600 mt-2 space-y-1">
-                        <p>Selected {selectedPositions.size} of 9 tiles to apply.</p>
-                        <p>Preview mode: {blendPreview ? 'Blended (existing tiles fade to edges)' : 'Raw model output'}</p>
-                      </div>
-                    )}
+                    {/* Compact summary moved to footer toolbar */}
                   </Tabs.Content>
                 </Tabs.Root>
               </div>
 
-              {/* Footer */}
-              <div className="px-0 pb-0">
-                <div className="flex w-full items-center justify-end gap-2">
-                  <button
-                    onClick={handleClose}
-                    className="px-3 py-2 rounded-lg text-xs border border-gray-300 hover:bg-gray-50"
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    onClick={handleReset}
-                    disabled={loading}
-                    className="px-3 py-2 rounded-lg text-xs border border-gray-300 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
-                  >
-                    Reset Modal
-                  </button>
-                  <button
-                    onClick={handleAccept}
-                    disabled={loading || !previewTiles || selectedPositions.size === 0}
-                    className="px-3 py-2 rounded-lg text-xs bg-green-600 text-white hover:bg-green-700 disabled:bg-gray-300 disabled:cursor-not-allowed inline-flex items-center gap-2"
-                  >
-                    <Check className="w-4 h-4" />
-                    Accept Change
-                  </button>
+              {/* Compact Footer Toolbar */}
+              <div className="sticky bottom-0 inset-x-0 bg-white/95 backdrop-blur border-t px-3 py-2 rounded-b-2xl">
+                <div className="flex items-center gap-3">
+                  {/* Left: status pills */}
+                  <div className="flex items-center gap-2 min-w-0">
+                    <Tooltip.Provider delayDuration={300}>
+                      <Tooltip.Root>
+                        <Tooltip.Trigger asChild>
+                          <span className="inline-flex items-center gap-1 px-2 h-7 rounded-full bg-gray-100 text-gray-700 text-[11px] font-medium">
+                            {selectedPositions.size}/9
+                          </span>
+                        </Tooltip.Trigger>
+                        <Tooltip.Portal>
+                          <Tooltip.Content sideOffset={6} className="z-[10002] bg-gray-900 text-white px-2 py-1 rounded text-xs">
+                            Selected {selectedPositions.size} of 9 tiles to apply
+                            <Tooltip.Arrow className="fill-gray-900" />
+                          </Tooltip.Content>
+                        </Tooltip.Portal>
+                      </Tooltip.Root>
+
+                      <Tooltip.Root>
+                        <Tooltip.Trigger asChild>
+                          <span className="inline-flex items-center px-2 h-7 rounded-full border text-[11px] text-gray-700">
+                            {blendPreview ? 'Blended' : 'Raw'}
+                          </span>
+                        </Tooltip.Trigger>
+                        <Tooltip.Portal>
+                          <Tooltip.Content sideOffset={6} className="z-[10002] bg-gray-900 text-white px-2 py-1 rounded text-xs">
+                            Preview mode: {blendPreview ? 'Blended (existing tiles fade to edges)' : 'Raw model output'}
+                            <Tooltip.Arrow className="fill-gray-900" />
+                          </Tooltip.Content>
+                        </Tooltip.Portal>
+                      </Tooltip.Root>
+
+                      {typeof driftPeak === 'number' && (
+                        <span className="text-[11px] text-gray-500">Peak {driftPeak.toFixed(3)}</span>
+                      )}
+                    </Tooltip.Provider>
+                  </div>
+
+                  {/* Middle section intentionally empty to keep toolbar single-line and compact. */}
+
+                  {/* Right: actions */}
+                  <div className="ml-auto flex items-center gap-1">
+                    {/* Nudge toggle */}
+                    <Tooltip.Provider delayDuration={300}>
+                      <Tooltip.Root>
+                        <Tooltip.Trigger asChild>
+                          <button
+                            className={`h-8 px-2 inline-flex items-center gap-1 rounded-md border hover:bg-gray-50 ${nudgeOpen ? 'bg-gray-50' : ''}`}
+                            onClick={() => {
+                              const next = !nudgeOpen;
+                              setNudgeOpen(next);
+                              if (!next) {
+                                // Reset when closing to ensure no accidental application
+                                setOffsetX(0); setOffsetY(0); setDriftPeak(null); setNudgeApplied(false);
+                              }
+                            }}
+                          >
+                            {/* simple icon via CSS caret */}
+                            <span className={`transition-transform ${nudgeOpen ? 'rotate-90' : ''}`}>▸</span>
+                            <span className="text-[11px]">Nudge</span>
+                          </button>
+                        </Tooltip.Trigger>
+                        <Tooltip.Portal>
+                          <Tooltip.Content sideOffset={6} className="z-[10002] bg-gray-900 text-white px-2 py-1 rounded text-xs">Optional drift correction</Tooltip.Content>
+                        </Tooltip.Portal>
+                      </Tooltip.Root>
+                    </Tooltip.Provider>
+
+                    <Tooltip.Provider delayDuration={300}>
+                      <Tooltip.Root>
+                        <Tooltip.Trigger asChild>
+                          <button
+                            onClick={handleClose}
+                            className="h-8 w-8 inline-flex items-center justify-center rounded-md border hover:bg-gray-50"
+                            aria-label="Close"
+                          >
+                            <Close className="w-4 h-4" />
+                          </button>
+                        </Tooltip.Trigger>
+                        <Tooltip.Portal>
+                          <Tooltip.Content sideOffset={6} className="z-[10002] bg-gray-900 text-white px-2 py-1 rounded text-xs">Cancel</Tooltip.Content>
+                        </Tooltip.Portal>
+                      </Tooltip.Root>
+
+                      <Tooltip.Root>
+                        <Tooltip.Trigger asChild>
+                          <button
+                            onClick={handleReset}
+                            disabled={loading}
+                            className="h-8 w-8 inline-flex items-center justify-center rounded-md border hover:bg-gray-50 disabled:opacity-50"
+                            aria-label="Reset"
+                          >
+                            <RotateCcw className="w-4 h-4" />
+                          </button>
+                        </Tooltip.Trigger>
+                        <Tooltip.Portal>
+                          <Tooltip.Content sideOffset={6} className="z-[10002] bg-gray-900 text-white px-2 py-1 rounded text-xs">Reset modal</Tooltip.Content>
+                        </Tooltip.Portal>
+                      </Tooltip.Root>
+                    </Tooltip.Provider>
+
+                    <button
+                      onClick={handleAccept}
+                      disabled={loading || !previewTiles || selectedPositions.size === 0}
+                      className="h-8 px-3 rounded-md text-xs bg-green-600 text-white hover:bg-green-700 disabled:bg-gray-300 disabled:cursor-not-allowed inline-flex items-center gap-1.5"
+                    >
+                      <Check className="w-4 h-4" />
+                      Accept
+                    </button>
+                  </div>
                 </div>
+                {/* Nudge expandable row */}
+                {nudgeOpen && previewTiles && (
+                  <div className="mt-2 flex items-center gap-2 text-xs">
+                    <span className="text-gray-700">Drift correction</span>
+                    <div className="flex items-center gap-1">
+                      <label className="text-gray-700">X</label>
+                      <input
+                        type="number"
+                        className="w-16 h-7 border rounded px-1"
+                        value={offsetX}
+                        onChange={async (e) => {
+                          const v = parseInt(e.target.value, 10) || 0;
+                          setOffsetX(v);
+                          if (previewId && blendPreview) await loadPreviewTiles(previewId, true);
+                        }}
+                      />
+                    </div>
+                    <div className="flex items-center gap-1">
+                      <label className="text-gray-700">Y</label>
+                      <input
+                        type="number"
+                        className="w-16 h-7 border rounded px-1"
+                        value={offsetY}
+                        onChange={async (e) => {
+                          const v = parseInt(e.target.value, 10) || 0;
+                          setOffsetY(v);
+                          if (previewId && blendPreview) await loadPreviewTiles(previewId, true);
+                        }}
+                      />
+                    </div>
+                    <button
+                      className="h-7 px-2 inline-flex items-center gap-1 rounded border hover:bg-gray-50 disabled:opacity-50"
+                      disabled={!previewId || driftLoading}
+                      onClick={async () => {
+                        if (previewId) {
+                          const suggestion = await computeDrift(previewId);
+                          setNudgeApplied(true);
+                          if (blendPreview) await loadPreviewTiles(previewId, true, suggestion?.tx, suggestion?.ty);
+                        }
+                      }}
+                    >
+                      <Wand2 className="w-3.5 h-3.5" />
+                      Suggest
+                    </button>
+                    {typeof driftPeak === 'number' && (
+                      <span className="text-gray-500">Peak {driftPeak.toFixed(3)}</span>
+                    )}
+                    <span className="text-gray-500">
+                      Using {Array.from(selectedPositions).filter(k => !newTilePositions.has(k)).length} existing selected tile(s)
+                    </span>
+                  </div>
+                )}
               </div>
             </div>
           </div>
